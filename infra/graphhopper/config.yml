@@ -1,0 +1,31 @@
+graphhopper:
+  datareader.file: ""
+  graph.location: /data/graph-cache
+
+  profiles:
+    - name: truck
+      custom_model:
+        distance_influence: 70
+        speed:
+          - if: "true"
+            limit_to: "80"
+        priority:
+          - if: "road_class == PRIMARY || road_class == TRUNK"
+            multiply_by: "1.0"
+          - if: "road_class == SECONDARY"
+            multiply_by: "0.8"
+
+  profiles_ch: []
+  profiles_lm: []
+
+  import.osm.ignored_highways: "footway,cycleway,path,pedestrian,steps"
+
+server:
+  application_connectors:
+    - type: http
+      port: 8989
+      bind_host: 0.0.0.0
+  admin_connectors:
+    - type: http
+      port: 8990
+      bind_host: 0.0.0.0
