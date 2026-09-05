@@ -16,10 +16,21 @@ export default function InteractiveMap({
   const { colors, isDark } = useTheme();
   const [mapReady, setMapReady] = useState(false);
 
-  // CartoDB tiles without {r} to prevent 404 on literal retina parameter
-  const tileUrl = isDark
-    ? 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png'
-    : 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png';
+  // Carto API key — set EXPO_PUBLIC_CARTO_API_KEY in your .env file.
+  // Expo automatically inlines EXPO_PUBLIC_* vars at bundle time (SDK 49+).
+  const CARTO_API_KEY = process.env.EXPO_PUBLIC_CARTO_API_KEY || '';
+
+  // Carto authenticated tile URLs.
+  // With a key, use the Maps API v3 endpoint which supports authenticated access.
+  // Without a key we fall back to the public (unauthenticated) endpoint so the
+  // map still renders during development without a .env file.
+  const tileUrl = CARTO_API_KEY
+    ? isDark
+      ? `https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png?api_key=${CARTO_API_KEY}`
+      : `https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png?api_key=${CARTO_API_KEY}`
+    : isDark
+      ? 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png'
+      : 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png';
 
   const mapBg = isDark ? '#111111' : '#E8E8E8';
   const popupBg = isDark ? '#1C1C1E' : '#FFFFFF';
@@ -57,38 +68,55 @@ html,body{margin:0;padding:0;width:100%;height:100%;background-color:${mapBg};ov
 <script>
 ${LEAFLET_JS}
 
-// Initialize Leaflet map
+// ── Diagnostic bridge: forward JS errors back to React Native ──
+window.onerror = function(msg, src, line, col, err) {
+  try {
+    window.ReactNativeWebView && window.ReactNativeWebView.postMessage(
+      JSON.stringify({ type: 'JS_ERROR', msg: msg, src: src, line: line })
+    );
+  } catch(_) {}
+};
+
+// ── Initialize Leaflet map ──
+// NOTE: preferCanvas:false (default SVG renderer) is far more reliable on
+// Android System WebView hardware-accelerated mode. Canvas mode combined with
+// software rendering causes tiles to be decoded but never painted to screen.
 var map = L.map('map', {
   zoomControl: false,
-  attributionControl: false,
-  preferCanvas: true
+  attributionControl: false
 }).setView([25.85, 91.88], 10);
 
-// Primary CartoDB tile layer with subdomains
+// Primary CartoDB tile layer.
+// crossOrigin is NOT set (defaults to false) — avoids the Anonymous-CORS img
+// decode bug in Android System WebView where crossOrigin img elements are
+// silently dropped from the composited layer when GPU acceleration is on.
 var primaryLayer = L.tileLayer('${tileUrl}', {
   maxZoom: 19,
-  subdomains: 'abcd',
-  crossOrigin: true
+  subdomains: 'abcd'
 });
 
-// Automatic fallback to standard OpenStreetMap if CartoDB is blocked on mobile network
+// Automatic fallback to OSM if CartoDB tiles fail on the mobile network.
 var osmFallback = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  maxZoom: 19,
-  crossOrigin: true
+  maxZoom: 19
 });
 
 var tileFailed = false;
-primaryLayer.on('tileerror', function() {
+primaryLayer.on('tileerror', function(e) {
   if (!tileFailed) {
     tileFailed = true;
-    try { map.removeLayer(primaryLayer); } catch(e) {}
+    try { map.removeLayer(primaryLayer); } catch(_) {}
     osmFallback.addTo(map);
+    try {
+      window.ReactNativeWebView && window.ReactNativeWebView.postMessage(
+        JSON.stringify({ type: 'TILE_FALLBACK', url: e.tile && e.tile.src })
+      );
+    } catch(_) {}
   }
 });
 
 primaryLayer.addTo(map);
 
-// Invalidate size immediately and periodically to ensure correct dimensions on mobile layout
+// Invalidate size to ensure Leaflet fills the container after WebView layout.
 map.invalidateSize(true);
 setTimeout(function(){ map.invalidateSize(true); }, 100);
 setTimeout(function(){ map.invalidateSize(true); }, 300);
@@ -246,10 +274,14 @@ try {
     try {
       const data = JSON.parse(event.nativeEvent.data);
       if (data.type === 'MAP_READY') {
-        console.log('[InteractiveMap] Mobile Map Ready');
+        console.log('[InteractiveMap] Map Ready');
         setMapReady(true);
       } else if (data.type === 'SELECT_SEGMENT' && onSelectSegment) {
         onSelectSegment(data.segment);
+      } else if (data.type === 'JS_ERROR') {
+        console.warn('[InteractiveMap] WebView JS Error:', data.msg, 'at', data.src, 'line', data.line);
+      } else if (data.type === 'TILE_FALLBACK') {
+        console.log('[InteractiveMap] CartoDB failed, switched to OSM fallback. URL:', data.url);
       }
     } catch (e) {}
   };
@@ -273,7 +305,10 @@ try {
       <WebView
         ref={webViewRef}
         originWhitelist={['*']}
-        source={{ html: mapHtml, baseUrl: 'https://tile.openstreetmap.org' }}
+        // baseUrl must be a valid HTTPS origin so the Android System WebView
+        // treats HTTPS tile requests as same-scheme and allows them through.
+        // Using about:blank or https://localhost causes CORS blocks for external tiles.
+        source={{ html: mapHtml, baseUrl: 'https://www.openstreetmap.org' }}
         style={styles.webView}
         containerStyle={styles.container}
         javaScriptEnabled={true}
@@ -281,12 +316,17 @@ try {
         allowFileAccess={true}
         allowUniversalAccessFromFileURLs={true}
         mixedContentMode="always"
-        androidLayerType="software"
+        // hardware (default 'none') lets Android GPU-composite tile images correctly.
+        // 'software' forces the CPU path where img-element tiles are decoded but
+        // never promoted to a visible composited layer — causing a blank white screen.
+        androidLayerType="hardware"
         scrollEnabled={false}
         nestedScrollEnabled={false}
         overScrollMode="never"
-        cacheEnabled={false}
+        cacheEnabled={true}
         onMessage={handleMessage}
+        onLoadStart={() => console.log('[InteractiveMap] WebView loading...')}
+        onLoadEnd={() => console.log('[InteractiveMap] WebView loaded')}
         onError={(e) => console.warn('[InteractiveMap] WebView Error:', e.nativeEvent)}
         onHttpError={(e) => console.warn('[InteractiveMap] HTTP Error:', e.nativeEvent)}
       />
@@ -297,14 +337,11 @@ try {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    width: '100%',
-    height: '100%',
   },
   webView: {
     flex: 1,
-    width: '100%',
-    height: '100%',
+    // Do NOT set opacity < 1 — on some Android devices this creates an
+    // intermediate compositing surface that doesn't receive tile textures.
     backgroundColor: 'transparent',
-    opacity: 0.99,
   },
 });

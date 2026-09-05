@@ -1,7 +1,10 @@
 const jwt = require('jsonwebtoken');
 const db = require('../config/db');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'nirvana_sih26002_jwt_super_secret_key';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error('JWT_SECRET environment variable is not set. Add it to your .env file.');
+}
 
 async function authenticate(req, res, next) {
   const authHeader = req.headers.authorization;
